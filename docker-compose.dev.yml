@@ -1,0 +1,8 @@
+services:
+  bridge:
+    build: .
+    environment:
+      API_KEY: "test"
+      APP_ID: "test_app_id"
+      INSTALLATION_ID: 12345
+      PRIVATE_KEY_PATH: "/tmp/dummy_key.pem" 

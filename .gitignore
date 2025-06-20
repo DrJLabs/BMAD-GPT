@@ -1,32 +1,7 @@
-# Python
-__pycache__/
-*.pyc
-*.pyd
-*.pyo
-*.egg-info/
-.pytest_cache/
-
-# Environment variables
-.env
-.venv/
-venv/
-
-# Logs
-*.log
+keys/
 logs/
-
-# Sensitive files (private keys, credentials)
 *.pem
-*.key
-id_rsa
+secret-token.txt
 
-# Docker
-.docker/
-docker-compose.override.yml
-
-# BMAD-GPT internal directories
-.bmad-core/
-.cursor/
-
-# Ignore cursor AI rules
+#Ignore cursor AI rules
 .cursor/rules/codacy.mdc
