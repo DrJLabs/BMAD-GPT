@@ -3,5 +3,30 @@ logs/
 *.pem
 secret-token.txt
 
-#Ignore cursor AI rules
+# Environment files
+.env
+.env.production
+.cursor/.env
+
+# Ignore Cursor AI rules
 .cursor/rules/codacy.mdc
+
+# Python virtual environment
+venv/
+
+# Docker compose file (if it's specific to local/production and not meant for version control)
+docker-compose.yml
+
+# Compiled Python files and cache directories
+__pycache__/
+app/__pycache__/
+tests/__pycache__/
+
+# Nginx certificates (sensitive)
+nginx/certs/
+
+# VS Code settings
+.vscode/
+
+# Codacy related files
+.codacy/

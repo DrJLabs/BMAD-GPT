@@ -8,9 +8,11 @@ import os
 import json
 import uvicorn
 import time
+import requests
 from typing import Optional, Dict, Any
 from datetime import datetime
 import logging
+from fastapi.responses import JSONResponse
 
 # ────────────────────────────  Logging  ────────────────────────────
 logging.basicConfig(level=logging.INFO)
@@ -51,10 +53,10 @@ app = FastAPI(
 )
 
 # ─────────────────────  Middleware  ─────────────────────
-# app.add_middleware(
-#     TrustedHostMiddleware,
-#     allowed_hosts=["bmad.onemainarmy.com", "localhost", "127.0.0.1"],
-# )
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["bmad.onemainarmy.com", "localhost", "127.0.0.1"],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -106,26 +108,136 @@ def custom_openapi_schema():
     if app.openapi_schema:
         return app.openapi_schema
     
+    import time
+    current_timestamp = str(int(time.time()))
+    
     openapi_schema = {
         "openapi": "3.1.0",
         "info": {
             "title": "GitHub App Bridge",
-            "version": "3.0.1",
+            "version": f"3.0.1-{current_timestamp}",
             "description": "Secure bridge for GitHub repository operations via ChatGPT Actions",
         },
         "servers": [
             {
-                "url": "https://bmad.onemainarmy.com/github",
-                "description": "Production server",
+                "url": "https://bmad.onemainarmy.com",
+                "description": "Production Server"
             }
         ],
         "security": [{"BearerAuth": []}],
         "paths": {
+            "/list-repositories": {
+                "post": {
+                    "operationId": "listRepositories",
+                    "summary": "List accessible repositories",
+                    "description": "Get a list of repositories accessible to the authenticated GitHub App",
+                    "security": [{"BearerAuth": []}],
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string", "description": "Optional search query"},
+                                        "filter": {"type": "string", "description": "Optional filter (all, private, public)"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "List of repositories",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "data": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "repositories": {
+                                                        "type": "array",
+                                                        "items": {
+                                                            "type": "object",
+                                                            "properties": {
+                                                                "name": {"type": "string"},
+                                                                "full_name": {"type": "string"},
+                                                                "description": {"type": "string"},
+                                                                "private": {"type": "boolean"},
+                                                                "url": {"type": "string"},
+                                                                "clone_url": {"type": "string"},
+                                                                "default_branch": {"type": "string"},
+                                                                "language": {"type": "string"}
+                                                            }
+                                                        }
+                                                    },
+                                                    "count": {"type": "integer"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/get-file": {
+                "post": {
+                    "operationId": "getFile",
+                    "summary": "Get file contents from repository",
+                    "description": "Retrieve the contents of a specific file from a repository",
+                    "security": [{"BearerAuth": []}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["repo", "path"],
+                                    "properties": {
+                                        "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                        "path": {"type": "string", "description": "File path in repository"},
+                                        "branch": {"type": "string", "description": "Optional branch name"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "File contents",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "data": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "content": {"type": "string"},
+                                                    "encoding": {"type": "string"},
+                                                    "size": {"type": "integer"},
+                                                    "sha": {"type": "string"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/": {
                 "post": {
                     "operationId": "bridgeCall",
-                    "summary": "Execute GitHub repository operations",
-                    "description": "Bridge endpoint for secure GitHub repository operations via ChatGPT Actions",
+                    "summary": "Execute GitHub repository operations (Legacy)",
+                    "description": "Legacy bridge endpoint - use specific endpoints above for better experience",
                     "security": [{"BearerAuth": []}],
                     "requestBody": {
                         "required": True,
@@ -192,21 +304,92 @@ def custom_openapi_schema():
                     "type": "object",
                     "required": ["op"],
                     "properties": {
-                        "op": {"type": "string"},
-                        "args": {"type": "object", "additionalProperties": True},
-                    },
+                        "op": {
+                            "type": "string",
+                            "enum": ["list_repos", "get_file", "put_file", "create_pr", "merge_pr", "comment_pr", "list_prs", "repo_admin", "workflow_dispatch", "get_repo_info", "create_branch", "list_branches", "list_commits"],
+                            "description": "Operation to perform"
+                        },
+                        "args": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "description": "Operation arguments"
+                        }
+                    }
                 }
-            },
-        },
+            }
+        }
     }
+    
     app.openapi_schema = openapi_schema
-    return openapi_schema
+    return app.openapi_schema
 
 app.openapi = custom_openapi_schema
 
 @app.get("/openapi.json", include_in_schema=False)
-async def custom_openapi():
-    return custom_openapi_schema()
+async def custom_openapi(v: Optional[str] = None):
+    # Clear the cached schema to ensure updates are reflected
+    app.openapi_schema = None
+    schema = custom_openapi_schema()
+    
+    # Add timestamp to force cache invalidation
+    timestamp = str(int(time.time()))
+    
+    # Return response with aggressive cache-busting headers
+    # Note: Cloudflare may override some headers, but the schema version changes
+    return JSONResponse(
+        content=schema,
+        headers={
+            "Access-Control-Allow-Origin": "https://chat.openai.com",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "Thu, 01 Jan 1970 00:00:00 GMT",
+            "ETag": f'"{timestamp}"',
+            "Last-Modified": f"{timestamp}",
+            "X-Cache-Bust": timestamp,
+            "Vary": "Accept-Encoding, Authorization",
+            "X-Schema-Version": timestamp
+        }
+    )
+
+@app.options("/openapi.json", include_in_schema=False)
+async def openapi_options():
+    # Handle CORS preflight for OpenAPI endpoint
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "https://chat.openai.com",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        }
+    )
+
+@app.get("/openai.json", include_in_schema=False)
+async def openai_json_alias(v: Optional[str] = None):
+    # Alias for common typo: openai.json instead of openapi.json
+    app.openapi_schema = None
+    schema = custom_openapi_schema()
+    
+    # Add timestamp to force cache invalidation
+    timestamp = str(int(time.time()))
+    
+    return JSONResponse(
+        content=schema,
+        headers={
+            "Access-Control-Allow-Origin": "https://chat.openai.com",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "Thu, 01 Jan 1970 00:00:00 GMT",
+            "ETag": f'"{timestamp}"',
+            "Last-Modified": f"{timestamp}",
+            "X-Cache-Bust": timestamp,
+            "Vary": "Accept-Encoding, Authorization",
+            "X-Schema-Version": timestamp
+        }
+    )
 
 
 # ─────────────────────  Pydantic models  ─────────────────────
@@ -252,7 +435,7 @@ class ListPRsPayload(BaseModel):
 
 class RepoAdminPayload(BaseModel):
     action: str = Field(..., description="Action to perform (create, rename, delete)")
-    repo: str = Field(..., description="Repository name (owner/repo) - required for rename, delete")
+    repo: Optional[str] = Field(None, description="Repository name (owner/repo) - required for rename, delete")
     new_repo_name: Optional[str] = Field(None, description="New repository name (required for rename)")
     description: Optional[str] = Field(None, description="Optional: Repository description (required for create)")
     private: Optional[bool] = Field(None, description="Optional: Whether repo should be private (required for create)")
@@ -286,6 +469,74 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 
+# ─────────────────────  NEW: Direct endpoints for better ChatGPT integration  ─────────────────────
+
+@app.post("/list-repositories")
+async def list_repositories_direct(
+    request: Request,
+    payload: Optional[dict] = None,
+    _api_key_ok: str = Depends(verify_api_key),
+):
+    """Direct endpoint for listing repositories - better for ChatGPT Actions"""
+    try:
+        rate_limit_check(request)
+        
+        # Get access token
+        access_token = get_install_token()
+        gh = Github(access_token)
+        
+        # Use empty args if no payload provided
+        args = payload or {}
+        
+        # Call the existing handler
+        result = await handle_list_repos(gh, args)
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in list_repositories_direct: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Operation failed: {str(e)}"
+        )
+
+
+@app.post("/get-file")
+async def get_file_direct(
+    request: Request,
+    payload: dict,
+    _api_key_ok: str = Depends(verify_api_key),
+):
+    """Direct endpoint for getting file contents - better for ChatGPT Actions"""
+    try:
+        rate_limit_check(request)
+        
+        # Validate required fields
+        if not payload.get("repo") or not payload.get("path"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Both 'repo' and 'path' are required"
+            )
+        
+        # Get access token
+        access_token = get_install_token()
+        gh = Github(access_token)
+        
+        # Call the existing handler
+        result = await handle_get_file(gh, payload)
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_file_direct: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Operation failed: {str(e)}"
+        )
+
+
 # ─────────────────────  Main bridge endpoint  ─────────────────────
 @app.post("/")
 async def bridge_call(
@@ -296,6 +547,7 @@ async def bridge_call(
     rate_limit_check(request)
     logger.info("Op %s Args %s", payload.op, json.dumps(payload.args))
 
+    # Create GitHub client using the installation token
     gh = Github(get_install_token(), per_page=100)
 
     try:
@@ -495,77 +747,105 @@ async def handle_list_repos(gh: Github, args: dict):
     query = args.get("query", "")
     
     try:
-        # For GitHub Apps, we need to use search or specific repo access
-        # since we can't list all user repos with app permissions
+        # For GitHub Apps, we need to get repositories accessible to this specific installation
+        # We cannot use get_user() because that requires different permissions
         
-        if query:
-            # Search for repositories with the given query
-            search_result = gh.search_repositories(query)
-            repos = list(search_result)
-        else:
-            # Try to access some known repositories or provide a helpful message
-            # Since GitHub Apps have limited repo access, we'll search for public repos
-            # from common organizations or provide instructions
-            search_queries = [
-                "user:DrJLabs"
-            ]
-
-            repos = []
-            for search_query in search_queries:
-                try:
-                    search_result = gh.search_repositories(search_query)
-                    repos.extend(list(search_result)[:10])  # Limit results per query
-                except Exception as e:
-                    logger.warning(f"Search query '{search_query}' failed: {e}")
-                    continue
+        logger.info(f"Attempting to list repositories for installation {INSTALL_ID}")
+        
+        # Get repositories accessible to this GitHub App installation
+        try:
+            # Use the direct GitHub API to get installation repositories
+            # This is the correct way for GitHub Apps
+            token = git_integration.get_access_token(INSTALL_ID).token
+            gh_installation = Github(token)
             
-            # Remove duplicates based on full_name
-            seen = set()
-            unique_repos = []
-            for repo in repos:
-                if repo.full_name not in seen:
-                    seen.add(repo.full_name)
-                    unique_repos.append(repo)
-            repos = unique_repos
-    
-        # Convert to list with essential information
-        repo_list = []
-        for repo in repos:
-            try:
-                repo_list.append({
-                    "name": repo.name,
-                    "full_name": repo.full_name,
-                    "description": repo.description,
-                    "private": repo.private,
-                    "url": repo.html_url,
-                    "clone_url": repo.clone_url,
-                    "default_branch": repo.default_branch,
-                    "created_at": repo.created_at.isoformat() if repo.created_at else None,
-                    "updated_at": repo.updated_at.isoformat() if repo.updated_at else None,
-                    "language": repo.language,
-                    "size": repo.size,
-                    "stargazers_count": repo.stargazers_count,
-                    "forks_count": repo.forks_count
-                })
-            except Exception as e:
-                logger.warning(f"Error processing repo {repo.full_name}: {e}")
-                continue
-        
-        return {
-            "repositories": repo_list,
-            "count": len(repo_list),
-            "filter": repo_type,
-            "query": query,
-            "note": "GitHub App has limited repository access. Use 'query' parameter to search for specific repositories."
-        }
+            # Get installation repositories using the proper endpoint
+            headers = {
+                'Authorization': f'token {token}',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+            
+            # Use the installation repositories endpoint
+            response = requests.get(
+                f'https://api.github.com/installation/repositories',
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                repos_data = data.get('repositories', [])
+                logger.info(f"Successfully retrieved {len(repos_data)} repositories from installation")
+                
+                # Convert to list with essential information
+                repo_list = []
+                for repo_data in repos_data:
+                    try:
+                        # If query is provided, filter repositories locally by name
+                        if query and (
+                            query.lower() not in repo_data['name'].lower() and 
+                            query.lower() not in repo_data['full_name'].lower()
+                        ):
+                            continue
+                            
+                        repo_list.append({
+                            "name": repo_data['name'],
+                            "full_name": repo_data['full_name'],
+                            "description": repo_data.get('description'),
+                            "private": repo_data['private'],
+                            "url": repo_data['html_url'],
+                            "clone_url": repo_data['clone_url'],
+                            "default_branch": repo_data['default_branch'],
+                            "created_at": repo_data['created_at'],
+                            "updated_at": repo_data['updated_at'],
+                            "language": repo_data.get('language'),
+                            "size": repo_data['size'],
+                            "stargazers_count": repo_data['stargazers_count'],
+                            "forks_count": repo_data['forks_count']
+                        })
+                    except Exception as e:
+                        logger.warning(f"Error processing repo {repo_data.get('full_name', 'unknown')}: {e}")
+                        continue
+                
+                return {
+                    "status": "success",
+                    "data": {
+                        "repositories": repo_list,
+                        "count": len(repo_list),
+                        "total_accessible": len(repos_data),
+                        "filter": repo_type,
+                        "query": query,
+                        "access_method": "github_app_installation",
+                        "note": "GitHub App shows repositories where it has been installed. Query parameter filters within your accessible repositories only."
+                    }
+                }
+            else:
+                logger.error(f"GitHub API error: {response.status_code} - {response.text}")
+                raise Exception(f"GitHub API returned {response.status_code}: {response.text}")
+                
+        except Exception as e:
+            logger.error(f"Error accessing installation repositories: {e}")
+            return {
+                "status": "error", 
+                "data": {
+                    "repositories": [],
+                    "count": 0,
+                    "error": f"Unable to access repositories: {str(e)}",
+                    "note": "GitHub App repository access requires proper installation and permissions. Please ensure the GitHub App is installed on your repositories.",
+                    "installation_id": INSTALL_ID,
+                    "troubleshooting": "Visit https://github.com/settings/installations to check GitHub App installations"
+                }
+            }
         
     except Exception as e:
         logger.error(f"Error in list_repos: {e}")
         return {
-            "repositories": [],
-            "count": 0,
-            "error": str(e),
-            "note": "GitHub App repository access is limited. Try using the 'query' parameter to search for specific repositories."
+            "status": "error", 
+            "data": {
+                "repositories": [],
+                "count": 0,
+                "error": str(e),
+                "note": "GitHub App repository access failed. Please check GitHub App installation and permissions."
+            }
         }
 
 
@@ -628,8 +908,8 @@ async def handle_list_prs(gh: Github, args: ListPRsPayload):
     try:
         pulls = repo.get_pulls(
             state=args.state if args.state else "open",
-            head=args.head if args.head else Github.UNKNOWN,
-            base=args.base if args.base else Github.UNKNOWN,
+            head=args.head if args.head else None,
+            base=args.base if args.base else None,
             sort=args.sort if args.sort else "created",
             direction=args.direction if args.direction else "desc"
         )

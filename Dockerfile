@@ -7,16 +7,13 @@ ENV PYTHONPATH=/app
 
 # Install dependencies from requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install pytest pytest-asyncio httpx
 
 # Copy application code
 COPY app /app
-COPY tests /app/tests
-COPY pytest.ini /app/pytest.ini
 
 EXPOSE 5555
 
 # Update build time label
-LABEL build_time="2025-02-21T12:00:00Z"
+LABEL build_time="2025-06-20T23:30:00Z"
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5555"]

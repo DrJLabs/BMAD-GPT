@@ -1,8 +1,39 @@
 services:
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - bridge
+
   bridge:
+    build: .
+    env_file:
+      - .env
+    # Removed ports, Nginx will handle external access
+    volumes:
+      - ./keys:/keys:ro
+    # The environment variables below are for local testing only.
+    # For production, ensure you manage these securely (e.g., Docker secrets or your deployment platform's env management).
+    environment:
+      # These are examples for local development and testing.
+      # Production values should be set securely via .env or secrets.
+      API_KEY: "${API_KEY:-test}" # Default to 'test' if not set in .env
+      APP_ID: "${APP_ID:-test_app_id}" # Default if not set in .env
+      INSTALLATION_ID: "${INSTALLATION_ID:-12345}" # Default if not set in .env
+      PRIVATE_KEY_PATH: "${PRIVATE_KEY:-/tmp/dummy_key.pem}" # Default if not set in .env
+
+  test:
     build: .
     environment:
       API_KEY: "test"
       APP_ID: "test_app_id"
-      INSTALLATION_ID: 12345
-      PRIVATE_KEY_PATH: "/tmp/dummy_key.pem" 
+      INSTALLATION_ID: "12345"
+      PRIVATE_KEY_PATH: "/tmp/dummy_key.pem"
+      CORS_ORIGINS: "https://chat.openai.com,http://localhost:5555"
+      RATE_LIMIT_REQUESTS: "100"
+      RATE_LIMIT_WINDOW: "3600" 
