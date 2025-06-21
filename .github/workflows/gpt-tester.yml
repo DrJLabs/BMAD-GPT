@@ -1,0 +1,9 @@
+name: BMAD-GPT Bridge Test
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print test message
+        run: echo "BMAD-GPT Bridge test ran successfully!"
