@@ -1,3 +1,5 @@
+HELLO CHANTRY
+
 # BMAD-GPT
 
 Welcome to **BMAD-GPT** — an advanced AI-powered GitHub repository leveraging the BMAD (Breakthrough Method of Agile AI-driven Development) framework.
