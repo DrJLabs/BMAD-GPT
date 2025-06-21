@@ -30,18 +30,107 @@ CLIENT_ID   = os.environ["APP_ID"]                    # GitHub App *client* ID (
 INSTALL_ID  = int(os.environ["INSTALLATION_ID"])      # Installation ID (int)
 PK_PATH     = os.environ["PRIVATE_KEY_PATH"]          # /run/secrets/… path
 
-# NOTE: keep as *string* for older PyGitHub versions
+# Load private key for JWT signing
 if API_KEY != "test":
     with open(PK_PATH, "rb") as f:
         PRIVATE_KEY = f.read().decode("utf-8")
-    git_integration = GithubIntegration(CLIENT_ID, PRIVATE_KEY)
 else:
-    class DummyGitIntegration:
-        def get_access_token(self, *_):
-            class DummyAccessToken:
-                token = "dummy_token"
-            return DummyAccessToken()
-    git_integration = DummyGitIntegration()
+    PRIVATE_KEY = None
+
+# Token cache with expiry
+_token_cache = {
+    "token": None,
+    "expires_at": 0
+}
+
+def generate_jwt() -> str:
+    """Generate a fresh JWT for GitHub App authentication"""
+    if API_KEY == "test":
+        return "dummy_jwt"
+    
+    if not PRIVATE_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Private key not available"
+        )
+    
+    try:
+        import jwt
+        
+        # JWT payload - expires in 10 minutes max, issued 60 seconds ago for clock drift
+        now = int(time.time())
+        payload = {
+            'iat': now - 60,  # Issued 60 seconds ago to account for clock drift
+            'exp': now + 600,  # Expires in 10 minutes (max allowed)
+            'iss': CLIENT_ID   # GitHub App client ID
+        }
+        
+        # Generate JWT using RS256 algorithm - use the private key string directly
+        token = jwt.encode(payload, PRIVATE_KEY, algorithm='RS256')
+        logger.info(f"Generated fresh JWT for GitHub App {CLIENT_ID}")
+        return token
+        
+    except Exception as e:
+        logger.error(f"Failed to generate JWT: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"JWT generation failed: {str(e)}"
+        )
+
+def get_install_token() -> str:
+    """Get installation access token with proper caching and expiry checking"""
+    if API_KEY == "test":
+        return "dummy_token"
+    
+    now = time.time()
+    
+    # Check if cached token is still valid (with 5-minute buffer before expiry)
+    if (_token_cache["token"] and 
+        _token_cache["expires_at"] > now + 300):  # 5 min buffer
+        logger.debug("Using cached installation token")
+        return _token_cache["token"]
+    
+    # Generate fresh JWT and get new installation token
+    try:
+        jwt_token = generate_jwt()
+        
+        # Request installation access token using fresh JWT
+        headers = {
+            'Authorization': f'Bearer {jwt_token}',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+        }
+        
+        response = requests.post(
+            f'https://api.github.com/app/installations/{INSTALL_ID}/access_tokens',
+            headers=headers,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        token_data = response.json()
+        access_token = token_data['token']
+        
+        # Parse expiry time (GitHub returns ISO format)
+        expires_at_str = token_data['expires_at']
+        expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')).timestamp()
+        
+        # Cache the token
+        _token_cache["token"] = access_token
+        _token_cache["expires_at"] = expires_at
+        
+        logger.info(f"Generated fresh installation token, expires at {expires_at_str}")
+        return access_token
+        
+    except Exception as e:
+        logger.error(f"Failed to get installation token: {e}")
+        # Clear cache on error
+        _token_cache["token"] = None
+        _token_cache["expires_at"] = 0
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"GitHub authentication failed: {str(e)}"
+        )
 
 # ─────────────────────  FastAPI initialisation  ─────────────────────
 app = FastAPI(
@@ -70,10 +159,6 @@ security = HTTPBearer()
 rate_limit_storage: Dict[str, list[float]] = {}
 
 
-def get_install_token() -> str:
-    return git_integration.get_access_token(INSTALL_ID).token
-
-
 def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> str:
@@ -92,7 +177,7 @@ def verify_api_key(
 
 def rate_limit_check(request: Request) -> None:
     now = time.time()
-    ip = request.client.host
+    ip = request.client.host if request.client else "unknown"
     history = [t for t in rate_limit_storage.get(ip, []) if now - t < RATE_LIMIT_WINDOW]
     rate_limit_storage[ip] = history
     if len(history) >= RATE_LIMIT_REQUESTS:
@@ -236,14 +321,166 @@ def custom_openapi_schema():
             "/": {
                 "post": {
                     "operationId": "bridgeCall",
-                    "summary": "Execute GitHub repository operations (Legacy)",
-                    "description": "Legacy bridge endpoint - use specific endpoints above for better experience",
+                    "summary": "Execute GitHub repository operations",
+                    "description": "Main endpoint for GitHub operations - supports all repository management functions including file operations, PR management, branch operations, and more",
                     "security": [{"BearerAuth": []}],
                     "requestBody": {
                         "required": True,
                         "content": {
                             "application/json": {
-                                "schema": {"$ref": "#/components/schemas/Payload"}
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["op"],
+                                    "properties": {
+                                        "op": {
+                                            "type": "string",
+                                            "enum": [
+                                                "list_repos", "get_file", "put_file", "create_pr", "merge_pr", 
+                                                "comment_pr", "list_prs", "repo_admin", "workflow_dispatch", 
+                                                "get_repo_info", "create_branch", "list_branches", "list_commits",
+                                                "list_operations", "ping"
+                                            ],
+                                            "description": "Operation to perform"
+                                        },
+                                        "args": {
+                                            "type": "object",
+                                            "description": "Operation arguments - structure varies by operation type",
+                                            "properties": {
+                                                "repo": {
+                                                    "type": "string",
+                                                    "description": "Repository name (owner/repo) - required for most operations"
+                                                },
+                                                "path": {
+                                                    "type": "string", 
+                                                    "description": "File path in repository - required for file operations"
+                                                },
+                                                "content": {
+                                                    "type": "string",
+                                                    "description": "File content - required for put_file operation"
+                                                },
+                                                "message": {
+                                                    "type": "string",
+                                                    "description": "Commit message - required for put_file operation"
+                                                },
+                                                "title": {
+                                                    "type": "string",
+                                                    "description": "Pull request title - required for create_pr operation"
+                                                },
+                                                "head": {
+                                                    "type": "string",
+                                                    "description": "Source branch - required for create_pr operation"
+                                                },
+                                                "base": {
+                                                    "type": "string",
+                                                    "description": "Target branch - required for create_pr operation"
+                                                },
+                                                "pr_number": {
+                                                    "type": "integer",
+                                                    "description": "Pull request number - required for PR operations"
+                                                },
+                                                "branch_name": {
+                                                    "type": "string",
+                                                    "description": "Branch name - required for create_branch operation"
+                                                },
+                                                "comment_body": {
+                                                    "type": "string",
+                                                    "description": "Comment text - required for comment_pr operation"
+                                                },
+                                                "action": {
+                                                    "type": "string",
+                                                    "enum": ["create", "rename", "delete"],
+                                                    "description": "Repository action - required for repo_admin operation"
+                                                },
+                                                "workflow_id": {
+                                                    "type": "string",
+                                                    "description": "Workflow ID - required for workflow_dispatch operation"
+                                                },
+                                                "branch": {
+                                                    "type": "string",
+                                                    "description": "Optional: Branch name for various operations"
+                                                },
+                                                "sha": {
+                                                    "type": "string",
+                                                    "description": "Optional: SHA for file updates or commit references"
+                                                },
+                                                "ref": {
+                                                    "type": "string",
+                                                    "description": "Optional: Git reference (branch/tag/commit)"
+                                                },
+                                                "body": {
+                                                    "type": "string",
+                                                    "description": "Optional: Pull request description"
+                                                },
+                                                "draft": {
+                                                    "type": "boolean",
+                                                    "description": "Optional: Create as draft PR"
+                                                },
+                                                "state": {
+                                                    "type": "string",
+                                                    "enum": ["open", "closed", "all"],
+                                                    "description": "Optional: Filter PRs by state"
+                                                },
+                                                "sort": {
+                                                    "type": "string",
+                                                    "enum": ["created", "updated", "popularity", "long-running"],
+                                                    "description": "Optional: Sort order for listings"
+                                                },
+                                                "direction": {
+                                                    "type": "string",
+                                                    "enum": ["asc", "desc"],
+                                                    "description": "Optional: Sort direction"
+                                                },
+                                                "merge_method": {
+                                                    "type": "string",
+                                                    "enum": ["merge", "squash", "rebase"],
+                                                    "description": "Optional: PR merge method"
+                                                },
+                                                "commit_title": {
+                                                    "type": "string",
+                                                    "description": "Optional: Merge commit title"
+                                                },
+                                                "commit_message": {
+                                                    "type": "string",
+                                                    "description": "Optional: Merge commit message"
+                                                },
+                                                "source_branch": {
+                                                    "type": "string",
+                                                    "description": "Optional: Source branch for branch creation"
+                                                },
+                                                "new_repo_name": {
+                                                    "type": "string",
+                                                    "description": "Optional: New repository name for rename operation"
+                                                },
+                                                "description": {
+                                                    "type": "string",
+                                                    "description": "Optional: Repository description"
+                                                },
+                                                "private": {
+                                                    "type": "boolean",
+                                                    "description": "Optional: Whether repository should be private"
+                                                },
+                                                "auto_init": {
+                                                    "type": "boolean",
+                                                    "description": "Optional: Initialize repository with README"
+                                                },
+                                                "inputs": {
+                                                    "type": "object",
+                                                    "description": "Optional: Workflow inputs for workflow_dispatch"
+                                                },
+                                                "type": {
+                                                    "type": "string",
+                                                    "description": "Optional: Repository type filter for list_repos"
+                                                },
+                                                "query": {
+                                                    "type": "string",
+                                                    "description": "Optional: Search query for list_repos"
+                                                }
+                                            },
+                                                                                         "additionalProperties": False
+                                         }
+                                     },
+                                     "additionalProperties": False
+                                }
                             }
                         },
                     },
@@ -300,19 +537,254 @@ def custom_openapi_schema():
                 "BearerAuth": {"type": "http", "scheme": "bearer"}
             },
             "schemas": {
-                "Payload": {
+                "ListReposPayload": {
                     "type": "object",
                     "required": ["op"],
                     "properties": {
-                        "op": {
-                            "type": "string",
-                            "enum": ["list_repos", "get_file", "put_file", "create_pr", "merge_pr", "comment_pr", "list_prs", "repo_admin", "workflow_dispatch", "get_repo_info", "create_branch", "list_branches", "list_commits"],
-                            "description": "Operation to perform"
-                        },
+                        "op": {"type": "string", "enum": ["list_repos"], "description": "List repositories operation"},
                         "args": {
                             "type": "object",
-                            "additionalProperties": True,
-                            "description": "Operation arguments"
+                            "properties": {
+                                "type": {"type": "string", "description": "Optional: Repository type filter (all, owner, member, public, private)"},
+                                "query": {"type": "string", "description": "Optional: Search query"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "GetFilePayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["get_file"], "description": "Get file contents operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "path"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "path": {"type": "string", "description": "File path in repository"},
+                                "ref": {"type": "string", "description": "Optional: Branch/commit reference"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "PutFilePayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["put_file"], "description": "Create or update file operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "path", "content", "message"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "path": {"type": "string", "description": "File path in repository"},
+                                "content": {"type": "string", "description": "Content to write to file"},
+                                "message": {"type": "string", "description": "Commit message"},
+                                "branch": {"type": "string", "description": "Optional: Branch name"},
+                                "sha": {"type": "string", "description": "Optional: SHA of the file to update"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "CreatePRPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["create_pr"], "description": "Create pull request operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "title", "head", "base"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "title": {"type": "string", "description": "Pull request title"},
+                                "head": {"type": "string", "description": "Branch where changes are implemented"},
+                                "base": {"type": "string", "description": "Branch to merge changes into"},
+                                "body": {"type": "string", "description": "Optional: Pull request body"},
+                                "draft": {"type": "boolean", "description": "Optional: Create as draft PR"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "MergePRPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["merge_pr"], "description": "Merge pull request operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "pr_number"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "pr_number": {"type": "integer", "description": "Pull request number"},
+                                "commit_title": {"type": "string", "description": "Optional: Title for merge commit"},
+                                "commit_message": {"type": "string", "description": "Optional: Extra detail for merge commit"},
+                                "merge_method": {"type": "string", "enum": ["merge", "squash", "rebase"], "description": "Optional: Merge method"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "CommentPRPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["comment_pr"], "description": "Add comment to pull request operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "pr_number", "comment_body"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "pr_number": {"type": "integer", "description": "Pull request number"},
+                                "comment_body": {"type": "string", "description": "Comment to add to the pull request"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "ListPRsPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["list_prs"], "description": "List pull requests operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "state": {"type": "string", "enum": ["open", "closed", "all"], "description": "Optional: Filter by state"},
+                                "head": {"type": "string", "description": "Optional: Filter by head user/org and branch"},
+                                "base": {"type": "string", "description": "Optional: Filter by base branch"},
+                                "sort": {"type": "string", "enum": ["created", "updated", "popularity", "long-running"], "description": "Optional: Sort by"},
+                                "direction": {"type": "string", "enum": ["asc", "desc"], "description": "Optional: Sort direction"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "RepoAdminPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["repo_admin"], "description": "Repository administration operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["action"],
+                            "properties": {
+                                "action": {"type": "string", "enum": ["create", "rename", "delete"], "description": "Action to perform"},
+                                "repo": {"type": "string", "description": "Repository name (owner/repo) - required for rename, delete"},
+                                "new_repo_name": {"type": "string", "description": "New repository name (required for rename)"},
+                                "description": {"type": "string", "description": "Optional: Repository description (required for create)"},
+                                "private": {"type": "boolean", "description": "Optional: Whether repo should be private (required for create)"},
+                                "auto_init": {"type": "boolean", "description": "Optional: Initialize with README (required for create)"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "WorkflowDispatchPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["workflow_dispatch"], "description": "Trigger GitHub Actions workflow operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "workflow_id"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "workflow_id": {"type": "string", "description": "Workflow file name or ID"},
+                                "ref": {"type": "string", "description": "Optional: The ref (branch or tag) to trigger the workflow on"},
+                                "inputs": {"type": "object", "description": "Optional: Inputs to pass to the workflow"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "GetRepoInfoPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["get_repo_info"], "description": "Get repository information operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "CreateBranchPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["create_branch"], "description": "Create new branch operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo", "branch_name"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "branch_name": {"type": "string", "description": "Name for the new branch"},
+                                "source_branch": {"type": "string", "description": "Optional: Source branch to create from"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "ListBranchesPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["list_branches"], "description": "List branches operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "ListCommitsPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["list_commits"], "description": "List commits operation"},
+                        "args": {
+                            "type": "object",
+                            "required": ["repo"],
+                            "properties": {
+                                "repo": {"type": "string", "description": "Repository name (owner/repo)"},
+                                "sha": {"type": "string", "description": "Optional: SHA or branch name to list commits from"}
+                            },
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "ListOperationsPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["list_operations"], "description": "List available operations"},
+                        "args": {
+                            "type": "object",
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "PingPayload": {
+                    "type": "object",
+                    "required": ["op"],
+                    "properties": {
+                        "op": {"type": "string", "enum": ["ping"], "description": "Ping the service"},
+                        "args": {
+                            "type": "object",
+                            "additionalProperties": False
                         }
                     }
                 }
@@ -733,12 +1205,15 @@ async def bridge_call(
 # ─────────────────────  Operation handlers  ─────────────────────
 async def handle_get_file(gh: Github, args: dict):
     repo = gh.get_repo(args["repo"])
-    blob = repo.get_contents(args["path"], ref=args.get("ref", "HEAD"))
+    contents = repo.get_contents(args["path"], ref=args.get("ref", "HEAD"))
+    # get_contents can return a list for directories, but we expect a single file
+    if isinstance(contents, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is a directory, not a file")
     return {
-        "content": blob.decoded_content.decode(),
-        "sha": blob.sha,
-        "size": blob.size,
-        "encoding": blob.encoding,
+        "content": contents.decoded_content.decode(),
+        "sha": contents.sha,
+        "size": contents.size,
+        "encoding": contents.encoding,
     }
 
 
@@ -756,7 +1231,7 @@ async def handle_list_repos(gh: Github, args: dict):
         try:
             # Use the direct GitHub API to get installation repositories
             # This is the correct way for GitHub Apps
-            token = git_integration.get_access_token(INSTALL_ID).token
+            token = get_install_token()
             gh_installation = Github(token)
             
             # Get installation repositories using the proper endpoint
@@ -850,10 +1325,12 @@ async def handle_list_repos(gh: Github, args: dict):
 
 
 async def handle_put_file(gh: Github, args: PutFilePayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         contents = repo.get_contents(args.path, ref=args.branch if args.branch else repo.default_branch)
+        # get_contents can return a list for directories, but we expect a single file
+        if isinstance(contents, list):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is a directory, not a file")
         repo.update_file(contents.path, args.message, args.content, contents.sha, branch=args.branch if args.branch else repo.default_branch)
         return {"status": "success", "data": {"message": "File updated successfully"}}
     except Exception as e:
@@ -864,12 +1341,11 @@ async def handle_put_file(gh: Github, args: PutFilePayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_create_pr(gh: Github, args: CreatePRPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         pull_request = repo.create_pull(
             title=args.title,
-            body=args.body,
+            body=args.body or "",
             head=args.head,
             base=args.base,
             draft=args.draft if args.draft is not None else False
@@ -879,22 +1355,25 @@ async def handle_create_pr(gh: Github, args: CreatePRPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_merge_pr(gh: Github, args: MergePRPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         pull = repo.get_pull(args.pr_number)
-        merge_result = pull.merge(
-            commit_title=args.commit_title,
-            commit_message=args.commit_message,
-            merge_method=args.merge_method
-        )
+        # Handle optional parameters properly
+        merge_kwargs = {}
+        if args.commit_title:
+            merge_kwargs["commit_title"] = args.commit_title
+        if args.commit_message:
+            merge_kwargs["commit_message"] = args.commit_message
+        if args.merge_method:
+            merge_kwargs["merge_method"] = args.merge_method
+            
+        merge_result = pull.merge(**merge_kwargs)
         return {"status": "success", "data": {"merged": merge_result.merged, "message": merge_result.message}}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_comment_pr(gh: Github, args: CommentPRPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         pull = repo.get_pull(args.pr_number)
         comment = pull.create_issue_comment(args.comment_body)
@@ -903,48 +1382,46 @@ async def handle_comment_pr(gh: Github, args: CommentPRPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_list_prs(gh: Github, args: ListPRsPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
-        pulls = repo.get_pulls(
-            state=args.state if args.state else "open",
-            head=args.head if args.head else None,
-            base=args.base if args.base else None,
-            sort=args.sort if args.sort else "created",
-            direction=args.direction if args.direction else "desc"
-        )
+        # Handle optional parameters properly
+        pulls_kwargs = {
+            "state": args.state if args.state else "open",
+            "sort": args.sort if args.sort else "created",
+            "direction": args.direction if args.direction else "desc"
+        }
+        if args.head:
+            pulls_kwargs["head"] = args.head
+        if args.base:
+            pulls_kwargs["base"] = args.base
+            
+        pulls = repo.get_pulls(**pulls_kwargs)
         pr_list = [{"number": pr.number, "title": pr.title, "url": pr.html_url, "state": pr.state} for pr in pulls]
         return {"status": "success", "data": {"pull_requests": pr_list}}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_repo_admin(gh: Github, args: RepoAdminPayload):
-    owner_login = args.repo.split("/")[0] if args.repo else None
-    org_or_user = gh.get_user(owner_login) if owner_login else gh.get_user() # Get authenticated user if no owner provided for create
-
     try:
         if args.action == "create":
             if not args.new_repo_name or args.description is None or args.private is None or args.auto_init is None:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required arguments for repository creation")
-            new_repo = org_or_user.create_repo(
-                name=args.new_repo_name,
-                description=args.description,
-                private=args.private,
-                auto_init=args.auto_init
+            # For GitHub Apps, repository creation is more complex and may require organization context
+            # For now, we'll return an error indicating this operation needs additional implementation
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED, 
+                detail="Repository creation through GitHub App is not yet implemented. Use GitHub's web interface or a personal access token."
             )
-            return {"status": "success", "data": {"message": "Repository created successfully", "repo_url": new_repo.html_url}}
         elif args.action == "rename":
             if not args.repo or not args.new_repo_name:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required arguments for repository rename")
-            owner, repo_name = args.repo.split("/")
-            repo = gh.get_user(owner).get_repo(repo_name)
+            repo = gh.get_repo(args.repo)
             repo.edit(name=args.new_repo_name)
             return {"status": "success", "data": {"message": f"Repository renamed to {args.new_repo_name}"}}
         elif args.action == "delete":
             if not args.repo:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required argument 'repo' for repository deletion")
-            owner, repo_name = args.repo.split("/")
-            repo = gh.get_user(owner).get_repo(repo_name)
+            repo = gh.get_repo(args.repo)
             repo.delete()
             return {"status": "success", "data": {"message": "Repository deleted successfully"}}
         else:
@@ -953,8 +1430,7 @@ async def handle_repo_admin(gh: Github, args: RepoAdminPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_workflow_dispatch(gh: Github, args: WorkflowDispatchPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         workflow = repo.get_workflow(args.workflow_id)
         workflow.create_dispatch(ref=args.ref if args.ref else repo.default_branch, inputs=args.inputs if args.inputs else {})
@@ -963,8 +1439,7 @@ async def handle_workflow_dispatch(gh: Github, args: WorkflowDispatchPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_get_repo_info(gh: Github, args: GetRepoInfoPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         return {"status": "success", "data": {
             "name": repo.name,
@@ -986,8 +1461,7 @@ async def handle_get_repo_info(gh: Github, args: GetRepoInfoPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_create_branch(gh: Github, args: CreateBranchPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         source_branch_ref = repo.get_branch(args.source_branch if args.source_branch else repo.default_branch).commit.sha
         repo.create_git_ref(ref=f"refs/heads/{args.branch_name}", sha=source_branch_ref)
@@ -996,8 +1470,7 @@ async def handle_create_branch(gh: Github, args: CreateBranchPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_list_branches(gh: Github, args: ListBranchesPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         branches = repo.get_branches()
         branch_list = [{"name": branch.name, "commit_sha": branch.commit.sha} for branch in branches]
@@ -1006,8 +1479,7 @@ async def handle_list_branches(gh: Github, args: ListBranchesPayload):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"GitHub API error: {e}")
 
 async def handle_list_commits(gh: Github, args: ListCommitsPayload):
-    owner, repo_name = args.repo.split("/")
-    repo = gh.get_user(owner).get_repo(repo_name)
+    repo = gh.get_repo(args.repo)
     try:
         commits = repo.get_commits(sha=args.sha if args.sha else repo.default_branch)
         commit_list = [{"sha": commit.sha, "message": commit.commit.message, "author": commit.commit.author.name, "date": commit.commit.author.date.isoformat()} for commit in commits]

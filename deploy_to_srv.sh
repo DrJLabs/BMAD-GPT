@@ -16,6 +16,7 @@ sudo rsync -av --delete \
   --exclude 'venv' \
   --exclude '.cursor' \
   --exclude '__pycache__' \
+  --exclude '.codacy' \
   "$SRC" "$DST"
 
 # Deploy using production compose file
